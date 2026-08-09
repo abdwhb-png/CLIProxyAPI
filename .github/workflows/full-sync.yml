@@ -23,12 +23,16 @@ jobs:
           # 2. Ajouter le dépôt d'origine (remplacez par les bonnes infos)
           git remote add upstream https://github.com/router-for-me/CLIProxyAPI
           
-          # 3. Récupérer les nouveautés (branches + tags)
-          git fetch upstream --tags
-          
-          # 4. Fusionner la branche principale d'origine (ex: main ou master) dans votre branche actuelle
-          # Remplacez 'main' si la branche par défaut du dépôt d'origine s'appelle autrement
+          # 3. Synchronisation de la branche principale (ajustez 'main' si besoin)
           git merge upstream/main --ff-only || git merge upstream/main --no-edit
-          
-          # 5. Tout envoyer sur votre fork GitHub d'un seul coup
-          git push origin HEAD --tags
+          git push origin HEAD
+
+      - name: Pousser uniquement les tags manquants
+        run: |
+          # Cette boucle vérifie chaque tag d'upstream et ne pousse que ceux qui n'existent pas sur origin
+          for tag in $(git tag); do
+            if ! git ls-remote --tags origin | grep -q "refs/tags/$tag"; then
+              echo "Poussée du tag manquant : $tag"
+              git push origin refs/tags/$tag
+            fi
+          done
