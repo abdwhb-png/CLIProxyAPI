@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # Permet de pousser les modifications sur votre fork
+      actions: write # <--- CETTE LIGNE EST INDISPENSABLE POUR AUTORISER LA COPIE DES TAGS AVEC WORKFLOWS
     steps:
       - name: Checkout Fork
         uses: actions/checkout@v4
