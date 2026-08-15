@@ -14,12 +14,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # Récupère tout l'historique
+          token: ${{ secrets.CLE_WORKFLOW }}
 
       - name: Configurer Git, Synchroniser la Branche et les Tags
         run: |
           # 1. Configurer l'identité Git requise pour le merge
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@://github.com"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
           # 2. Ajouter le dépôt d'origine (remplacez par les bonnes infos)
           git remote add upstream https://github.com/router-for-me/CLIProxyAPI
