@@ -2,7 +2,9 @@ package session
 
 import (
 	"net/http"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -45,6 +47,44 @@ func TestExtractSessionInfoAllClients(t *testing.T) {
 		t.Errorf("Codex session ids mismatch: %+v", info)
 	}
 
+	// 2b. Codex CLI fork with X-Codex-Turn-Metadata
+	codexForkHeaders := http.Header{
+		"Session-Id": []string{"codex-fork-666"},
+		"X-Codex-Turn-Metadata": []string{
+			`{"session_id":"codex-fork-666","forked_from_thread_id":"codex-parent-111","request_kind":"turn"}`,
+		},
+	}
+	info, ok = ExtractSessionInfo(codexForkHeaders, nil, nil)
+	if !ok || info.ClientType != "codex" {
+		t.Fatalf("ExtractSessionInfo failed for Codex fork")
+	}
+	if info.SessionID != "codex:codex-fork-666" || info.ParentSessionID != "codex:codex-parent-111" {
+		t.Errorf("Codex fork session ids mismatch: %+v", info)
+	}
+	if !info.IsFork {
+		t.Errorf("expected IsFork=true for Codex fork: %+v", info)
+	}
+
+	// 2c. Codex CLI Multi-Agent v2 (collab_spawn)
+	codexSubagentHeaders := http.Header{
+		"Session-Id":        []string{"codex-root-001"},
+		"Thread-Id":         []string{"codex-sub-thread-002"},
+		"X-Openai-Subagent": []string{"collab_spawn"},
+		"X-Codex-Turn-Metadata": []string{
+			`{"session_id":"codex-root-001","thread_id":"codex-sub-thread-002","agent_name":"/root/check_readme","parent_thread_id":"codex-root-001","subagent_kind":"thread_spawn"}`,
+		},
+	}
+	info, ok = ExtractSessionInfo(codexSubagentHeaders, nil, nil)
+	if !ok || info.ClientType != "codex" {
+		t.Fatalf("ExtractSessionInfo failed for Codex Multi-Agent v2")
+	}
+	if info.SessionID != "codex:codex-root-001:agent:check_readme" || info.ParentSessionID != "codex:codex-root-001" {
+		t.Errorf("Codex Multi-Agent session ids mismatch: %+v", info)
+	}
+	if info.AgentName != "check_readme" || !info.IsSubagent {
+		t.Errorf("Codex Multi-Agent metadata mismatch: AgentName=%q, IsSubagent=%v", info.AgentName, info.IsSubagent)
+	}
+
 	// 3. Pi Slot Session
 	piHeaders := http.Header{
 		"X-Slot-Session-Id": []string{"pi-slot-777"},
@@ -62,6 +102,41 @@ func TestExtractSessionInfoAllClients(t *testing.T) {
 	info, ok = ExtractSessionInfo(opencodeHeaders, nil, nil)
 	if !ok || info.ClientType != "opencode" || info.SessionID != "affinity:oc-child-999" || info.ParentSessionID != "affinity:oc-parent-333" {
 		t.Errorf("OpenCode mismatch: %+v", info)
+	}
+
+	// 4b. Body-only fork in thread_id
+	bodyForkPayload := []byte(`{"thread_id":"child-thread-01","forked_from_thread_id":"parent-thread-00"}`)
+	info, ok = ExtractSessionInfo(nil, bodyForkPayload, nil)
+	if !ok || info.SessionID != "thread:child-thread-01" || info.ParentSessionID != "thread:parent-thread-00" || !info.IsFork || info.IsSubagent {
+		t.Errorf("body-only fork mismatch: %+v", info)
+	}
+
+	// 4c. Codex fork with both Session-Id and Thread-Id
+	codexForkBothHeaders := http.Header{
+		"Session-Id": []string{"parent-thread-00"},
+		"Thread-Id":  []string{"child-thread-01"},
+		"X-Codex-Turn-Metadata": []string{
+			`{"session_id":"parent-thread-00","thread_id":"child-thread-01","forked_from_thread_id":"parent-thread-00"}`,
+		},
+	}
+	info, ok = ExtractSessionInfo(codexForkBothHeaders, nil, nil)
+	if !ok || info.SessionID != "codex:child-thread-01" || info.ParentSessionID != "codex:parent-thread-00" || !info.IsFork {
+		t.Errorf("Codex fork with both sid and tid mismatch: %+v", info)
+	}
+
+	// 4d. Nested metadata forked_from_thread_id in body
+	nestedForkPayload := []byte(`{"thread_id":"child-t-99","metadata":{"forked_from_thread_id":"parent-t-88"}}`)
+	info, ok = ExtractSessionInfo(nil, nestedForkPayload, nil)
+	if !ok || info.SessionID != "thread:child-t-99" || info.ParentSessionID != "thread:parent-t-88" || !info.IsFork {
+		t.Errorf("nested body-only fork mismatch: %+v", info)
+	}
+
+	// 4e. Codex fork with Session-Id in header and thread_id + metadata.forked_from_thread_id in body
+	codexHeaderBodyForkHeaders := http.Header{"Session-Id": []string{"parent-sess-uuid"}}
+	codexHeaderBodyForkPayload := []byte(`{"thread_id":"child-thread-uuid","metadata":{"forked_from_thread_id":"parent-sess-uuid"}}`)
+	info, ok = ExtractSessionInfo(codexHeaderBodyForkHeaders, codexHeaderBodyForkPayload, nil)
+	if !ok || info.SessionID != "codex:child-thread-uuid" || info.ParentSessionID != "codex:parent-sess-uuid" || !info.IsFork {
+		t.Errorf("Codex fork with Session-Id header and body thread_id mismatch: %+v", info)
 	}
 
 	// 5. Antigravity X-Http-Session-Id
@@ -376,11 +451,18 @@ func TestExtractSessionInfoClaudePayloadOutranksGenericHeader(t *testing.T) {
 func TestExtractSessionInfoPromptCacheKeyAndClientReqAndMetadata(t *testing.T) {
 	t.Parallel()
 
-	// 1. prompt_cache_key
+	// 1. prompt_cache_key with conversation alias (not a parent-child edge)
 	payloadPCK := []byte(`{"prompt_cache_key":"prompt-key-123","conversation":{"id":"conv-456"}}`)
 	info, ok := ExtractSessionInfo(nil, payloadPCK, nil)
-	if !ok || info.SessionID != "pck:prompt-key-123" || info.ParentSessionID != "conv:conv-456" {
-		t.Fatalf("pck extraction failed: %+v", info)
+	if !ok || info.SessionID != "pck:prompt-key-123" || info.ParentSessionID != "" {
+		t.Fatalf("pck extraction failed (should not treat conv alias as parent): %+v", info)
+	}
+
+	// 1b. prompt_cache_key with explicit parentCandidate
+	payloadPCKWithParent := []byte(`{"prompt_cache_key":"prompt-key-123","conversation":{"id":"conv-456"},"parent_session_id":"pck-parent-789"}`)
+	infoWithParent, okWithParent := ExtractSessionInfo(nil, payloadPCKWithParent, nil)
+	if !okWithParent || infoWithParent.SessionID != "pck:prompt-key-123" || infoWithParent.ParentSessionID != "pck:pck-parent-789" {
+		t.Fatalf("pck with parent candidate extraction failed: %+v", infoWithParent)
 	}
 
 	// 2. plain metadata.user_id
@@ -531,5 +613,37 @@ func TestExtractSessionInfoNestedSubagentIDAndUserID(t *testing.T) {
 	}
 	if infoShadow.SessionID != "pck:nested-pck-valid" {
 		t.Fatalf("SessionID = %q, want pck:nested-pck-valid", infoShadow.SessionID)
+	}
+}
+
+func TestBoundSessionIdentitySafetyAndUniqueness(t *testing.T) {
+	t.Parallel()
+
+	// Short ID remains unchanged
+	shortID := "session:normal-length-session"
+	if got := BoundSessionIdentity(shortID); got != shortID {
+		t.Fatalf("shortID = %q, want %q", got, shortID)
+	}
+
+	// Long ID with Chinese UTF-8 characters exceeding 256 bytes
+	longChinese := strings.Repeat("会话测试超长标识符", 20) // ~18 bytes * 20 = 360 bytes
+	bounded1 := BoundSessionIdentity(longChinese)
+	if len(bounded1) > 256 {
+		t.Fatalf("bounded length = %d, want <= 256", len(bounded1))
+	}
+	if !utf8.ValidString(bounded1) {
+		t.Fatalf("bounded string is not valid UTF-8: %q", bounded1)
+	}
+
+	// Uniqueness: two long strings differing only at the end must produce distinct bounded IDs
+	longA := strings.Repeat("a", 250) + "-worker-1"
+	longB := strings.Repeat("a", 250) + "-worker-2"
+	boundedA := BoundSessionIdentity(longA)
+	boundedB := BoundSessionIdentity(longB)
+	if boundedA == boundedB {
+		t.Fatalf("collision detected between boundedA and boundedB: %q", boundedA)
+	}
+	if len(boundedA) > 256 || len(boundedB) > 256 {
+		t.Fatalf("bounded lengths = (%d, %d), want <= 256", len(boundedA), len(boundedB))
 	}
 }
